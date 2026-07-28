@@ -1,13 +1,11 @@
 """知识库内部接口。"""
 
-import threading
-
 from fastapi import APIRouter, Depends, File, UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.logger import get_logger
 from app.db.mysql.models.knowledge import DocumentParseStatus
-from app.db.mysql.session import get_db, get_session_factory
+from app.db.mysql.session import get_db
 from app.schemas.request.knowledge import (
     KnowledgeBaseCreateRequest,
     KnowledgeBaseUpdateRequest,
@@ -20,33 +18,11 @@ from app.schemas.response.knowledge import (
     KnowledgeDocumentResponse,
     KnowledgeSearchResponse,
 )
+from app.services.kb_job_queue import enqueue_document_job
 from app.services.knowledge_service import KnowledgeService
 
 router = APIRouter()
 log = get_logger("api.knowledge")
-
-
-def _run_process_document(doc_id: int) -> None:
-    """后台线程：独立 Session 处理文档，避免请求结束后连接被关闭。"""
-    db = get_session_factory()()
-    try:
-        KnowledgeService(db).process_uploaded_document(doc_id)
-    except Exception as e:
-        log.exception(f"[doc_id={doc_id}] 后台线程未捕获异常: {e}")
-    finally:
-        db.close()
-
-
-def _schedule_process_document(doc_id: int) -> None:
-    """用独立 daemon 线程跑长任务，不占用 ASGI 请求周期 / 线程池。"""
-    thread = threading.Thread(
-        target=_run_process_document,
-        args=(doc_id,),
-        name=f"kb-doc-{doc_id}",
-        daemon=True,
-    )
-    thread.start()
-    log.info(f"[doc_id={doc_id}] 已启动后台处理线程 {thread.name}")
 
 
 @router.get(
@@ -92,10 +68,20 @@ def update_knowledge_base(
     req: KnowledgeBaseUpdateRequest,
     db: Session = Depends(get_db),
 ) -> ApiResponse[KnowledgeBaseResponse]:
-    return ApiResponse.ok(
-        KnowledgeService(db).update_knowledge_base(kb_id, req),
-        message="更新成功",
-    )
+    svc = KnowledgeService(db)
+    # 变更前记录 Embedding，用于提示是否触发重建
+    before = svc.get_knowledge_base(kb_id)
+    data = svc.update_knowledge_base(kb_id, req)
+    message = "更新成功"
+    if (
+        "embedding_model_id" in req.model_dump(exclude_unset=True)
+        and before.embedding_model_id != data.embedding_model_id
+    ):
+        message = (
+            "更新成功：Embedding 模型已变更，旧向量已清空，"
+            "相关文档已重新排队向量化，请在文档列表查看进度"
+        )
+    return ApiResponse.ok(data, message=message)
 
 
 @router.delete(
@@ -149,11 +135,11 @@ async def upload_documents(
     files: list[UploadFile] = File(..., description="pdf/docx/xlsx 多文件"),
     db: Session = Depends(get_db),
 ) -> ApiResponse[list[KnowledgeDocumentResponse]]:
-    """先落盘并立即返回；解析/切分/向量化在独立线程执行，前端轮询文档状态。"""
+    """先落盘并立即返回；解析/切分/向量化由 Redis 队列异步执行，前端轮询文档状态。"""
     data = await KnowledgeService(db).upload_documents(kb_id, files)
     for item in data:
         if item.parse_status == DocumentParseStatus.PROCESSING and item.file_path:
-            _schedule_process_document(item.id)
+            enqueue_document_job(item.id)
     return ApiResponse.ok(data, message="文件已接收，后台处理中，请在列表查看进度")
 
 

@@ -6,7 +6,7 @@
 
 from typing import Optional
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -14,6 +14,8 @@ from app.core.context import get_current_role, get_current_user_id
 from app.core.exceptions import BusinessError, ForbiddenError, NotFoundError
 from app.core.logger import get_logger
 from app.core.security import decrypt_text, encrypt_text, mask_api_key
+from app.db.mysql.models.conversation import Conversation
+from app.db.mysql.models.knowledge import KnowledgeBase
 from app.db.mysql.models.model_config import ModelConfig, ModelScope, ModelType
 from app.db.redis import CACHE_PREFIX_PUBLIC_MODELS, RedisCache
 from app.schemas.request.model import ModelCreateRequest, ModelUpdateRequest
@@ -178,8 +180,26 @@ class ModelService:
         return self._to_response(row)
 
     def delete_model(self, model_id: int) -> None:
-        """删除模型配置。"""
+        """删除模型配置。
+
+        若仍被会话或知识库引用则拒绝删除，避免产生脏引用。
+        """
         row = self._get_editable_row(model_id)
+        conv_count = self.db.scalar(
+            select(func.count())
+            .select_from(Conversation)
+            .where(Conversation.model_id == model_id)
+        ) or 0
+        kb_count = self.db.scalar(
+            select(func.count())
+            .select_from(KnowledgeBase)
+            .where(KnowledgeBase.embedding_model_id == model_id)
+        ) or 0
+        if conv_count or kb_count:
+            raise BusinessError(
+                f"模型仍被引用，无法删除（会话 {conv_count} 个，知识库 {kb_count} 个）。"
+                "请先更换或删除相关会话/知识库后再试"
+            )
         self.db.delete(row)
         self.db.commit()
         self._invalidate_public_cache(row)

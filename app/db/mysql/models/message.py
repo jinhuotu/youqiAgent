@@ -2,7 +2,7 @@
 
 import enum
 
-from sqlalchemy import Enum, Integer, String, Text
+from sqlalchemy import Enum, ForeignKey, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.mysql.models.base import Base, TimestampMixin, UserScopedMixin
@@ -29,6 +29,7 @@ class Message(Base, TimestampMixin, UserScopedMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     conversation_id: Mapped[int] = mapped_column(
         Integer,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
         comment="所属会话ID",

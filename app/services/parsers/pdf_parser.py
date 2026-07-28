@@ -1,5 +1,6 @@
 """PDF 文本抽取。"""
 
+from collections.abc import Iterator
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -8,18 +9,26 @@ from app.core.exceptions import BusinessError
 from app.services.parsers.cleaning import clean_extracted_text
 
 
-def extract_pdf_text(path: Path) -> str:
-    """从 PDF 抽取文本（不含 OCR）。"""
+def iter_pdf_page_texts(path: Path) -> Iterator[str]:
+    """逐页抽取 PDF 文本，避免先拼成超大字符串再处理。"""
     try:
         reader = PdfReader(str(path))
-        pages: list[str] = []
+        yielded = False
         for page in reader.pages:
-            pages.append(page.extract_text() or "")
-        text = clean_extracted_text("\n\n".join(pages))
-        if not text:
+            raw = page.extract_text() or ""
+            text = clean_extracted_text(raw)
+            if text:
+                yielded = True
+                yield text
+        if not yielded:
             raise BusinessError("PDF 未提取到文本（可能是扫描件，本期不支持 OCR）")
-        return text
     except BusinessError:
         raise
     except Exception as e:
         raise BusinessError(f"PDF 解析失败: {e}") from e
+
+
+def extract_pdf_text(path: Path) -> str:
+    """从 PDF 抽取全文（兼容旧调用；内部仍逐页抽取后拼接）。"""
+    pages = list(iter_pdf_page_texts(path))
+    return "\n\n".join(pages)

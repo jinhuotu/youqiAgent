@@ -1,10 +1,13 @@
 # Agent AI Service
 
-内部 AI 能力下沉服务：基于 FastAPI + LangChain 1.0+ + LangGraph，面向 Java 业务后端提供标准化 HTTP 接口。
+内部 AI 能力下沉服务：基于 FastAPI + LangChain，面向 Java 业务后端与运维台提供标准化 HTTP 接口。
 
 - **不对外暴露**、无独立用户鉴权体系
-- Java 后端携带 `X-Service-Token` + `X-User-Id` 内网调用
+- 调用方携带 `X-Service-Token` + `X-User-Id` 内网调用
 - 按 `user_id` 行级数据隔离
+
+> **能力边界（请勿误解）：** 当前已实现模型管理、多轮对话（SSE）、提示词、知识库上传/向量化/RAG、**外部 MCP 工具调用**。  
+> 完整工作流编排 / 自建 MCP Server 仍为后续演进项。
 
 ## 技术栈
 
@@ -12,9 +15,9 @@
 |------|----------|
 | Python | ≥ 3.11 |
 | FastAPI | 最新稳定版 |
-| LangChain / LangGraph | ≥ 1.0 |
+| LangChain | ≥ 1.0（对话 / Embedding） |
 | SQLAlchemy | ≥ 2.0 |
-| MySQL + Redis + ChromaDB | ChromaDB ≥ 1.0（Windows 预编译 wheel，无需本地编译） |
+| MySQL + Redis + ChromaDB | ChromaDB ≥ 1.0 |
 | Poetry | 依赖管理 |
 
 ## 快速开始
@@ -45,6 +48,7 @@ cp .env.example .env
 编辑 `.env`，至少配置：
 
 - MySQL 连接信息，并预先创建数据库：`CREATE DATABASE agent_ai DEFAULT CHARSET utf8mb4;`
+- Redis（知识库任务队列依赖；不可用时会降级为临时线程）
 - `INTERNAL_SERVICE_TOKENS`：服务间密钥（可多个，逗号分隔）
 - `ENCRYPTION_KEY`：Fernet 密钥，生成方式：
 
@@ -68,8 +72,10 @@ poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 启动后访问：
 
-- 健康检查：`GET http://127.0.0.1:8000/health`
+- 存活检查：`GET http://127.0.0.1:8000/health`
+- 就绪检查：`GET http://127.0.0.1:8000/ready`（探测 MySQL / Redis / Chroma）
 - API 文档：`http://127.0.0.1:8000/docs`（非生产环境）
+- 生产部署步骤见 [`DEPLOY.md`](./DEPLOY.md)
 
 ## 请求头规范
 
@@ -80,7 +86,7 @@ poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `X-User-Id` | 是 | Java 侧已鉴权用户 ID |
 | `X-Service-Token` | 是 | 服务间密钥 |
 | `X-Role` | 否 | `user` / `admin`，默认 `user` |
-| `Content-Type` | 是 | `application/json` |
+| `Content-Type` | 是 | `application/json`（上传接口除外） |
 
 ## 接口一览
 
@@ -90,7 +96,7 @@ poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `GET /api/v1/internal/models/{id}` — 模型详情
 - `POST /api/v1/internal/models` — 新增模型
 - `PUT /api/v1/internal/models/{id}` — 修改模型
-- `DELETE /api/v1/internal/models/{id}` — 删除模型
+- `DELETE /api/v1/internal/models/{id}` — 删除模型（仍被会话/知识库引用时拒绝）
 
 ### 会话与聊天
 
@@ -108,7 +114,7 @@ poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `GET/POST /api/v1/internal/prompts`
 - `GET/PUT/DELETE /api/v1/internal/prompts/{id}`
 
-### 知识库（最小闭环）
+### 知识库
 
 - `GET/POST /api/v1/internal/knowledge-bases`
 - `GET/PUT/DELETE /api/v1/internal/knowledge-bases/{id}`
@@ -117,13 +123,24 @@ poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `DELETE /api/v1/internal/knowledge-bases/{id}/documents/{doc_id}`
 - `POST /api/v1/internal/knowledge-bases/{id}/search`
 - 对话请求可传 `knowledge_base_id` / `rag_top_k` 开启 RAG
+- 文件入库走 **Redis 任务队列**（`KB_JOB_WORKERS`），启动时回收卡住任务
+
+### MCP（外部工具）
+
+- `GET/POST /api/v1/internal/mcp-servers`
+- `GET/PUT/DELETE /api/v1/internal/mcp-servers/{id}`
+- `POST /api/v1/internal/mcp-servers/{id}/test` — 测试连接
+- `POST /api/v1/internal/mcp-servers/{id}/sync` — 同步工具列表到缓存
+- 支持传输：`stdio` / `sse` / `http`；**仅管理员可维护**
+- 启用且已同步的工具会 **全局** 注入对话（SSE 事件：`tool_call` / `tool_result`）
+- 可选请求字段：`mcp_server_ids` / `tool_names` 过滤（供后续工作流）
 
 **上传说明：**
 
 - 格式：`.pdf` / `.docx` / `.xlsx`（不含扫描件 OCR、不含 `.doc`）
 - 限制：单次最多 10 个文件，单文件默认 ≤ 100MB（见 `UPLOAD_MAX_FILE_SIZE_MB`）
 - 流程：落盘 `UPLOAD_ROOT` → 解析文本 → 切分 → Embedding → Chroma → 可 RAG
-- 建议知识库配置独立 Embedding 模型，便于后续切换向量库
+- 建议知识库配置独立 Embedding 模型（`type=embedding`）；更换 Embedding 会清空旧向量并重建
 
 ### 系统信息
 
@@ -199,26 +216,31 @@ curl -N -X POST http://127.0.0.1:8000/api/v1/internal/chat/stream \
 ```
 app/
 ├── api/v1/internal/     # 内部 HTTP 接口
-├── core/                # 配置、日志、异常、上下文、安全
+├── core/                # 配置、日志、异常、上下文、安全、启动校验
 ├── schemas/             # Pydantic 请求/响应
-├── services/            # 业务层 + LLM 抽象
+├── services/            # 业务层 + LLM / 知识库队列
 ├── db/                  # MySQL / Redis / Vector
 ├── middleware/          # 内部鉴权
-├── agent/               # LangGraph / MCP 扩展预留
+├── agent/               # LangGraph / MCP 扩展预留（未实现）
 └── main.py
 alembic/                 # 数据库迁移
+tests/                   # 最小自动化测试
+DEPLOY.md                # 服务器部署说明
 ```
 
-## 扩展预留
+## 扩展预留（部分已落地）
 
-- `app/agent/`：LangGraph 智能体与工作流
-- `app/agent/mcp_placeholder.py`：MCP 工具挂载点
-- `app/db/vector/`：向量库抽象，当前 Chroma，可替换实现
-- `app/services/vector_service.py`：知识库 RAG 业务入口
+- **MCP Client**：已实现外部 MCP Server 接入与对话工具调用（见上文「MCP」）
+- `app/agent/`：AgentRegistry + MCP 会话挂载
+- 工作流编排 / 自建 MCP Server：后续演进
+- `app/db/vector/`：向量库抽象（已实现 Chroma；可替换实现）
+
+已落地的知识库入口在 `app/services/knowledge_service.py` / `vector_service.py`。
 
 ## 注意事项
 
-1. 生产环境请将 `ENV=production`，此时关闭 Swagger 且不返回异常堆栈
+1. 生产环境请将 `ENV=production`，此时关闭 Swagger、拒绝不安全占位密钥，且不返回异常堆栈
 2. API Key 在数据库中加密存储，日志自动脱敏
 3. 公共模型/模板仅 `X-Role: admin` 可管理
-4. 会话超过 30 轮返回 `is_warn_round=true`；达到 25 轮或 Token 占用 80% 自动总结
+4. 会话超过轮数阈值返回 `is_warn_round=true`；达阈值或 Token 占用过高会自动总结
+5. 运维台为独立前端仓库 `youqiAgent-web`，通过本地连接配置对接本服务

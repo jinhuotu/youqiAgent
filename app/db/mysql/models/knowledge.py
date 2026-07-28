@@ -3,7 +3,7 @@
 import enum
 from typing import Optional
 
-from sqlalchemy import Enum, Integer, SmallInteger, String, Text
+from sqlalchemy import Enum, ForeignKey, Integer, SmallInteger, String, Text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -56,6 +56,7 @@ class KnowledgeBase(Base, TimestampMixin, UserScopedMixin):
     )
     embedding_model_id: Mapped[Optional[int]] = mapped_column(
         Integer,
+        ForeignKey("models.id", ondelete="SET NULL"),
         nullable=True,
         comment="Embedding 模型配置ID，空则使用 Chroma 默认向量",
     )
@@ -76,6 +77,7 @@ class KnowledgeDocument(Base, TimestampMixin, UserScopedMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     knowledge_base_id: Mapped[int] = mapped_column(
         Integer,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
         comment="所属知识库ID",

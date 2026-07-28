@@ -183,11 +183,72 @@ class KnowledgeService:
         if "embedding_model_id" in data and data["embedding_model_id"] is not None:
             self.model_service.get_embedding_model_orm(data["embedding_model_id"])
 
+        old_embedding_id = row.embedding_model_id
+        embedding_changed = (
+            "embedding_model_id" in data and data["embedding_model_id"] != old_embedding_id
+        )
+
         for key, value in data.items():
             setattr(row, key, value)
         self.db.commit()
         self.db.refresh(row)
+
+        if embedding_changed:
+            requeued = self._reindex_after_embedding_change(row)
+            log.info(
+                f"知识库 Embedding 变更: kb_id={row.id}, "
+                f"{old_embedding_id} -> {row.embedding_model_id}, requeued={requeued}"
+            )
         return self._to_kb_response(row)
+
+    def _reindex_after_embedding_change(self, kb: KnowledgeBase) -> int:
+        """Embedding 变更后清空旧向量，并将文档重新入库。"""
+        from app.services.kb_job_queue import enqueue_document_job
+        from app.utils.chunking import chunk_text
+
+        collection = kb_collection_name(kb.id)
+        self.vector.delete_collection(collection)
+        self.vector.ensure_collection(
+            collection,
+            metadata={"kb_id": str(kb.id), "name": kb.name},
+        )
+
+        docs = self.db.scalars(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.knowledge_base_id == kb.id,
+                KnowledgeDocument.status == 1,
+            )
+        ).all()
+        requeued = 0
+        for doc in docs:
+            if doc.source_type == DocumentSourceType.FILE and doc.file_path:
+                doc.parse_status = DocumentParseStatus.PROCESSING
+                doc.error_message = "Embedding 已变更，等待重新向量化…"
+                doc.chunk_count = 0
+                self.db.commit()
+                enqueue_document_job(doc.id, force=True)
+                requeued += 1
+            elif (doc.content or "").strip():
+                try:
+                    chunks = chunk_text(doc.content)
+                    if not chunks:
+                        doc.parse_status = DocumentParseStatus.FAILED
+                        doc.error_message = "Embedding 变更后切分结果为空"
+                        self.db.commit()
+                        continue
+                    doc.chunk_count = len(chunks)
+                    self.db.commit()
+                    self._index_chunks(kb, doc, chunks)
+                    doc.parse_status = DocumentParseStatus.READY
+                    doc.error_message = None
+                    self.db.commit()
+                    requeued += 1
+                except Exception as e:
+                    log.exception(f"[doc_id={doc.id}] Embedding 变更后重建失败: {e}")
+                    doc.parse_status = DocumentParseStatus.FAILED
+                    doc.error_message = f"Embedding 变更重建失败: {str(e)[:200]}"
+                    self.db.commit()
+        return requeued
 
     def delete_knowledge_base(self, kb_id: int) -> None:
         row = self._get_accessible_kb(kb_id)
@@ -361,23 +422,45 @@ class KnowledgeService:
             abs_path = self.storage.resolve_absolute(doc.file_path)
             self._update_progress(doc, f"正在解析文件（{doc.file_ext}）…")
             t_parse = time.perf_counter()
-            text = extract_text(abs_path, doc.file_ext or "")
-            log.info(
-                f"[doc_id={doc.id}] 解析完成，文本长度={len(text)}，"
-                f"耗时 {time.perf_counter() - t_parse:.1f}s"
-            )
+            ext = (doc.file_ext or "").lower().lstrip(".")
 
             self._update_progress(doc, "正在切分文本…")
             t_chunk = time.perf_counter()
+            progress_every = max(1, self.settings.kb_chunk_progress_every)
 
             def _on_chunk(n: int, _piece: str) -> None:
-                """每切出一块立即落库，供前端轮询刷新「分块」列。"""
-                doc.chunk_count = n
-                doc.parse_status = DocumentParseStatus.PROCESSING
-                doc.error_message = f"正在切分文本 {n}…"[:500]
-                self.db.commit()
+                """按间隔落库进度，避免大文件每块都 commit。"""
+                if n == 1 or n % progress_every == 0:
+                    doc.chunk_count = n
+                    doc.parse_status = DocumentParseStatus.PROCESSING
+                    doc.error_message = f"正在切分文本 {n}…"[:500]
+                    self.db.commit()
 
-            chunks = chunk_text(text, on_chunk=_on_chunk)
+            if ext == "pdf":
+                from app.services.parsers.pdf_parser import iter_pdf_page_texts
+                from app.utils.chunking import iter_chunks_from_parts
+
+                page_texts: list[str] = []
+
+                def _pages():
+                    for p in iter_pdf_page_texts(abs_path):
+                        page_texts.append(p)
+                        yield p
+
+                chunks = list(iter_chunks_from_parts(_pages(), on_chunk=_on_chunk))
+                text = "\n\n".join(page_texts)
+                log.info(
+                    f"[doc_id={doc.id}] PDF 解析+切分完成，页数={len(page_texts)}，"
+                    f"文本长度={len(text)}，耗时 {time.perf_counter() - t_parse:.1f}s"
+                )
+            else:
+                text = extract_text(abs_path, doc.file_ext or "")
+                log.info(
+                    f"[doc_id={doc.id}] 解析完成，文本长度={len(text)}，"
+                    f"耗时 {time.perf_counter() - t_parse:.1f}s"
+                )
+                chunks = chunk_text(text, on_chunk=_on_chunk)
+
             if not chunks:
                 raise BusinessError("解析结果为空，无法入库（可能是扫描版 PDF，本期不支持 OCR）")
             doc.content = text
@@ -492,7 +575,7 @@ class KnowledgeService:
         doc: KnowledgeDocument,
         chunks: list[str],
     ) -> None:
-        """切分结果向量化写入；大批量时分批 Embedding 并打进度日志。"""
+        """切分结果向量化写入；按批 Embedding + 立即写入，避免全集文档驻留内存。"""
         import time
 
         collection = kb_collection_name(kb.id)
@@ -501,50 +584,56 @@ class KnowledgeService:
         t0 = time.perf_counter()
         log.info(f"[doc_id={doc.id}] 开始向量化入库，chunks={total}")
 
-        embeddings: Optional[list[list[float]]] = None
+        model_row = None
         if kb.embedding_model_id:
             model_row = self.model_service.get_embedding_model_orm(kb.embedding_model_id)
-            batch_size = max(1, min(self.settings.kb_embed_batch_size, 10))
-            embeddings = []
-            for start in range(0, total, batch_size):
-                end = min(start + batch_size, total)
-                batch = chunks[start:end]
-                self._update_progress(
-                    doc,
-                    f"正在向量化 {end}/{total}（Embedding）…",
-                )
-                log.info(
-                    f"[doc_id={doc.id}] Embedding 批次 {start + 1}-{end}/{total}"
-                )
-                embeddings.extend(embed_documents(model_row, batch))
-        else:
-            self._update_progress(doc, f"使用 Chroma 默认向量写入 {total} 块…")
-            log.info(f"[doc_id={doc.id}] 未配置 Embedding，使用 Chroma 默认向量")
 
-        documents = []
-        for i, text in enumerate(chunks):
-            documents.append(
-                VectorDocument(
-                    doc_id=f"doc_{doc.id}_chunk_{i}",
-                    content=text,
-                    metadata={
-                        "knowledge_base_id": str(kb.id),
-                        "document_id": str(doc.id),
-                        "title": doc.title,
-                        "chunk_index": i,
-                    },
-                    embedding=embeddings[i] if embeddings else None,
-                )
-            )
-
-        # Chroma 分批写入，避免单次过大
+        batch_size = max(1, min(self.settings.kb_embed_batch_size, 10))
         write_batch = 64
-        for start in range(0, total, write_batch):
-            end = min(start + write_batch, total)
-            self._update_progress(doc, f"正在写入向量库 {end}/{total}…")
-            self.vector._store.add_documents(collection, documents[start:end])
-            log.info(f"[doc_id={doc.id}] Chroma 写入 {start + 1}-{end}/{total}")
+        pending: list[VectorDocument] = []
 
+        def _flush(pending_docs: list[VectorDocument], end_idx: int) -> None:
+            if not pending_docs:
+                return
+            self._update_progress(doc, f"正在写入向量库 {end_idx}/{total}…")
+            self.vector._store.add_documents(collection, pending_docs)
+            log.info(
+                f"[doc_id={doc.id}] Chroma 写入至 {end_idx}/{total}（本批 {len(pending_docs)}）"
+            )
+            pending_docs.clear()
+
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch = chunks[start:end]
+            if model_row is not None:
+                self._update_progress(doc, f"正在向量化 {end}/{total}（Embedding）…")
+                log.info(f"[doc_id={doc.id}] Embedding 批次 {start + 1}-{end}/{total}")
+                vectors = embed_documents(model_row, batch)
+            else:
+                if start == 0:
+                    self._update_progress(doc, f"使用 Chroma 默认向量写入 {total} 块…")
+                    log.info(f"[doc_id={doc.id}] 未配置 Embedding，使用 Chroma 默认向量")
+                vectors = [None] * len(batch)
+
+            for offset, text in enumerate(batch):
+                i = start + offset
+                pending.append(
+                    VectorDocument(
+                        doc_id=f"doc_{doc.id}_chunk_{i}",
+                        content=text,
+                        metadata={
+                            "knowledge_base_id": str(kb.id),
+                            "document_id": str(doc.id),
+                            "title": doc.title,
+                            "chunk_index": i,
+                        },
+                        embedding=vectors[offset],
+                    )
+                )
+            if len(pending) >= write_batch:
+                _flush(pending, end)
+
+        _flush(pending, total)
         elapsed = time.perf_counter() - t0
         log.info(f"[doc_id={doc.id}] 向量化入库完成，耗时 {elapsed:.1f}s，chunks={total}")
 
@@ -614,6 +703,7 @@ class KnowledgeService:
         parts = [
             "以下是知识库检索到的相关资料，请优先依据这些内容回答；"
             "若资料不足请明确说明，不要编造。"
+            "回答时可自然引用资料编号（如「根据资料[1]」）。"
         ]
         for i, hit in enumerate(hits, start=1):
             meta = hit.get("metadata") or {}
@@ -621,3 +711,43 @@ class KnowledgeService:
             content = hit.get("content") or ""
             parts.append(f"[{i}] 来源《{title}》\n{content}")
         return "\n\n".join(parts)
+
+    @staticmethod
+    def hits_to_sources(
+        hits: list[dict[str, Any]],
+        *,
+        preview_chars: int = 240,
+    ) -> list[dict[str, Any]]:
+        """将检索命中转为前端可展示的引用来源。"""
+        sources: list[dict[str, Any]] = []
+        limit = max(40, preview_chars)
+        for hit in hits:
+            meta = hit.get("metadata") or {}
+            content = str(hit.get("content") or "")
+            preview = content if len(content) <= limit else content[:limit].rstrip() + "…"
+            doc_id_raw = meta.get("document_id")
+            chunk_raw = meta.get("chunk_index")
+            try:
+                document_id = int(doc_id_raw) if doc_id_raw is not None else None
+            except (TypeError, ValueError):
+                document_id = None
+            try:
+                chunk_index = int(chunk_raw) if chunk_raw is not None else None
+            except (TypeError, ValueError):
+                chunk_index = None
+            distance = hit.get("distance")
+            try:
+                distance_f = float(distance) if distance is not None else None
+            except (TypeError, ValueError):
+                distance_f = None
+            sources.append(
+                {
+                    "id": str(hit.get("id") or ""),
+                    "title": str(meta.get("title") or "未命名"),
+                    "content": preview,
+                    "document_id": document_id,
+                    "chunk_index": chunk_index,
+                    "distance": distance_f,
+                }
+            )
+        return sources

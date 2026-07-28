@@ -70,12 +70,50 @@ class Settings(BaseSettings):
     # ---------- 知识库 ----------
     kb_chunk_size: int = Field(default=800, description="知识库文本切分长度")
     kb_chunk_overlap: int = Field(default=100, description="知识库切分重叠长度")
+    kb_chunk_progress_every: int = Field(
+        default=10,
+        description="切分进度写库间隔（每 N 块提交一次，降低大文件 DB 压力）",
+    )
     kb_default_top_k: int = Field(default=5, description="RAG 默认召回条数")
+    kb_source_preview_chars: int = Field(
+        default=240,
+        description="对话引用展示时单条片段预览字数",
+    )
     # 阿里云 text-embedding-v3/v4 兼容接口单批上限 10；OpenAI 可更大
     kb_embed_batch_size: int = Field(default=10, description="Embedding 单批条数")
+    kb_job_workers: int = Field(default=1, description="知识库文档处理 worker 数")
+    kb_job_stuck_minutes: int = Field(
+        default=30,
+        description="processing 超时分钟数，启动时重新入队",
+    )
     upload_root: str = Field(default="./data/uploads", description="知识库上传文件根目录")
     upload_max_file_size_mb: int = Field(default=100, description="单文件最大 MB")
     upload_max_files_per_request: int = Field(default=10, description="单次最多上传文件数")
+
+    # ---------- MCP ----------
+    mcp_workdir: str = Field(
+        default="./data/mcp",
+        description="stdio MCP 子进程默认工作目录",
+    )
+    mcp_command_allowlist: str = Field(
+        default="npx,uvx,node,python,python3",
+        description="stdio 允许的命令名（basename），逗号分隔",
+    )
+    mcp_tool_timeout_seconds: int = Field(default=60, description="单次 MCP 工具调用超时秒")
+    mcp_tool_max_rounds: int = Field(default=8, description="对话中最多工具调用轮次")
+    mcp_tool_result_max_chars: int = Field(
+        default=8000,
+        description="工具结果写入模型上下文的最大字符数",
+    )
+
+    @property
+    def mcp_command_allowlist_set(self) -> set[str]:
+        """解析 stdio 命令白名单。"""
+        return {
+            x.strip().lower()
+            for x in self.mcp_command_allowlist.split(",")
+            if x.strip()
+        }
 
     @property
     def service_token_list(self) -> List[str]:

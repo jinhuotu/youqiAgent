@@ -47,6 +47,7 @@ logs/
 *.log
 data/chroma/
 data/uploads/
+data/mcp/
 !data/.gitkeep
 !logs/.gitkeep
 

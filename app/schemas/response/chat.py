@@ -40,6 +40,17 @@ class ConversationResponse(BaseModel):
     )
 
 
+class RagSourceItem(BaseModel):
+    """RAG 引用来源（供前端展示）。"""
+
+    id: str = Field(default="", description="向量块 ID")
+    title: str = Field(default="未命名", description="文档标题")
+    content: str = Field(default="", description="片段预览")
+    document_id: Optional[int] = Field(default=None, description="文档 ID")
+    chunk_index: Optional[int] = Field(default=None, description="块序号")
+    distance: Optional[float] = Field(default=None, description="向量距离（越小越相似）")
+
+
 class ChatInvokeResponse(BaseModel):
     """非流式问答响应。"""
 
@@ -49,3 +60,7 @@ class ChatInvokeResponse(BaseModel):
     round_count: int
     is_warn_round: bool = Field(default=False, description="是否超过轮数提醒阈值")
     summary_triggered: bool = Field(default=False, description="本次是否触发了自动总结")
+    sources: list[RagSourceItem] = Field(
+        default_factory=list,
+        description="本次 RAG 命中来源（未开启知识库时为空）",
+    )

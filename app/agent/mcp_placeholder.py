@@ -1,4 +1,8 @@
-"""MCP 工具扩展预留目录说明。
+"""MCP 扩展说明。
 
-后续可将 MCP Server / Client 工具挂载到 LangGraph Agent。
+正式实现见：
+- app/services/mcp_session.py
+- app/services/mcp_tool_adapter.py
+- app/services/mcp_server_service.py
+- app/api/v1/internal/mcp.py
 """

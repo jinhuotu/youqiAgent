@@ -12,6 +12,9 @@ from app.core.config import get_settings
 from app.db.mysql.models import Base  # noqa: F401  导入以注册 metadata
 from app.db.mysql.models import (  # noqa: F401
     Conversation,
+    KnowledgeBase,
+    KnowledgeDocument,
+    McpServer,
     Message,
     ModelConfig,
     PromptTemplate,

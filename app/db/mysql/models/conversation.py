@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from sqlalchemy import Integer, String, Text
+from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.mysql.models.base import Base, TimestampMixin, UserScopedMixin
@@ -27,6 +27,7 @@ class Conversation(Base, TimestampMixin, UserScopedMixin):
     )
     model_id: Mapped[int] = mapped_column(
         Integer,
+        ForeignKey("models.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
         comment="绑定的模型配置ID",

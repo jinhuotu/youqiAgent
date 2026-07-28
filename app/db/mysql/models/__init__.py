@@ -3,6 +3,7 @@
 from app.db.mysql.models.base import Base
 from app.db.mysql.models.conversation import Conversation
 from app.db.mysql.models.knowledge import KnowledgeBase, KnowledgeDocument
+from app.db.mysql.models.mcp_server import McpServer
 from app.db.mysql.models.message import Message
 from app.db.mysql.models.model_config import ModelConfig
 from app.db.mysql.models.prompt_template import PromptTemplate
@@ -17,4 +18,5 @@ __all__ = [
     "SystemConfig",
     "KnowledgeBase",
     "KnowledgeDocument",
+    "McpServer",
 ]

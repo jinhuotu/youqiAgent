@@ -47,3 +47,11 @@ class ChatInvokeRequest(BaseModel):
     )
     temperature: float = Field(default=0.7, ge=0, le=2, description="采样温度")
     max_tokens: Optional[int] = Field(default=None, ge=1, description="最大生成 token")
+    mcp_server_ids: Optional[list[int]] = Field(
+        default=None,
+        description="限定使用的 MCP Server ID 列表；空则使用全部已启用且已同步的工具",
+    )
+    tool_names: Optional[list[str]] = Field(
+        default=None,
+        description="限定工具名（server__tool）；空则不额外过滤",
+    )
