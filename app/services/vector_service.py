@@ -74,9 +74,15 @@ class VectorService:
             query_embeddings=[query_embedding] if query_embedding else None,
         )
 
-    def delete_collection(self, collection: str) -> bool:
-        """删除向量集合。"""
-        return self._store.delete_collection(collection)
+    def get_by_ids(
+        self,
+        doc_ids: list[str],
+        collection: str = DEFAULT_KNOWLEDGE_COLLECTION,
+    ) -> list[dict[str, Any]]:
+        """按向量文档 ID 批量读取。"""
+        if not doc_ids:
+            return []
+        return self._store.get_by_ids(collection, doc_ids)
 
     def health_check(self) -> bool:
         """健康检查。"""

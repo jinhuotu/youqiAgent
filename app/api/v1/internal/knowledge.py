@@ -10,12 +10,14 @@ from app.schemas.request.knowledge import (
     KnowledgeBaseCreateRequest,
     KnowledgeBaseUpdateRequest,
     KnowledgeDocumentCreateRequest,
+    KnowledgeEvalRequest,
     KnowledgeSearchRequest,
 )
 from app.schemas.response.common import ApiResponse
 from app.schemas.response.knowledge import (
     KnowledgeBaseResponse,
     KnowledgeDocumentResponse,
+    KnowledgeEvalResponse,
     KnowledgeSearchResponse,
 )
 from app.services.kb_job_queue import enqueue_document_job
@@ -168,3 +170,16 @@ def search_knowledge(
     db: Session = Depends(get_db),
 ) -> ApiResponse[KnowledgeSearchResponse]:
     return ApiResponse.ok(KnowledgeService(db).search(kb_id, req))
+
+
+@router.post(
+    "/{kb_id}/eval",
+    response_model=ApiResponse[KnowledgeEvalResponse],
+    summary="知识库语义检索评测（黄金集）",
+)
+def eval_knowledge(
+    kb_id: int,
+    req: KnowledgeEvalRequest,
+    db: Session = Depends(get_db),
+) -> ApiResponse[KnowledgeEvalResponse]:
+    return ApiResponse.ok(KnowledgeService(db).evaluate_retrieval(kb_id, req))

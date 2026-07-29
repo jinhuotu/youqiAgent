@@ -79,6 +79,23 @@ class Settings(BaseSettings):
         default=240,
         description="对话引用展示时单条片段预览字数",
     )
+    # Chroma distance 越小越相似；<=0 表示不过滤。默认 1.5 适合常见 L2 向量，可按试检索调参
+    kb_rag_max_distance: float = Field(
+        default=1.5,
+        description="RAG 最大允许 distance；<=0 关闭距离门槛",
+    )
+    kb_neighbor_window: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description="命中块左右扩展邻块数；0 表示不扩展",
+    )
+    kb_retrieve_candidate_multiplier: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        description="距离过滤前多召回倍数，保证过滤后仍接近 top_k",
+    )
     # 阿里云 text-embedding-v3/v4 兼容接口单批上限 10；OpenAI 可更大
     kb_embed_batch_size: int = Field(default=10, description="Embedding 单批条数")
     kb_job_workers: int = Field(default=1, description="知识库文档处理 worker 数")

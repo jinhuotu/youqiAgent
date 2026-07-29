@@ -66,4 +66,33 @@ class KnowledgeSearchResponse(BaseModel):
 
     query: str
     top_k: int
+    max_distance: Optional[float] = Field(
+        default=None,
+        description="当前生效的距离上限；<=0 表示未启用",
+    )
+    neighbor_window: int = Field(default=0, description="邻块扩展窗口")
     hits: list[KnowledgeSearchHit]
+
+
+class KnowledgeEvalCaseResult(BaseModel):
+    """单条评测结果。"""
+
+    query: str
+    hit: bool
+    hit_at: Optional[int] = None
+    reason: str = ""
+    top_ids: list[str] = Field(default_factory=list)
+    top_distances: list[Optional[float]] = Field(default_factory=list)
+
+
+class KnowledgeEvalResponse(BaseModel):
+    """评测汇总。"""
+
+    total: int
+    hit_count: int
+    hit_rate: float
+    mrr: float
+    top_k: int
+    max_distance: float
+    neighbor_window: int
+    cases: list[KnowledgeEvalCaseResult]

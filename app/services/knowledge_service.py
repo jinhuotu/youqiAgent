@@ -22,15 +22,24 @@ from app.schemas.request.knowledge import (
     KnowledgeBaseCreateRequest,
     KnowledgeBaseUpdateRequest,
     KnowledgeDocumentCreateRequest,
+    KnowledgeEvalRequest,
     KnowledgeSearchRequest,
 )
 from app.schemas.response.knowledge import (
     KnowledgeBaseResponse,
     KnowledgeDocumentResponse,
+    KnowledgeEvalCaseResult,
+    KnowledgeEvalResponse,
     KnowledgeSearchHit,
     KnowledgeSearchResponse,
 )
 from app.services.file_storage import FileStorageService
+from app.services.kb_retrieve_refine import (
+    expand_hits_with_neighbors,
+    filter_by_max_distance,
+    neighbor_chunk_ids,
+    score_eval_hit,
+)
 from app.services.llm.embedding import embed_documents, embed_query
 from app.services.model_service import ModelService
 from app.services.parsers import extract_text
@@ -652,6 +661,8 @@ class KnowledgeService:
         return KnowledgeSearchResponse(
             query=req.query,
             top_k=req.top_k,
+            max_distance=float(self.settings.kb_rag_max_distance),
+            neighbor_window=int(self.settings.kb_neighbor_window),
             hits=[
                 KnowledgeSearchHit(
                     id=str(h.get("id", "")),
@@ -682,17 +693,105 @@ class KnowledgeService:
         query: str,
         top_k: int,
     ) -> list[dict[str, Any]]:
+        """向量召回 + 距离门槛 + 邻块扩展。"""
         collection = kb_collection_name(kb.id)
         query_embedding: Optional[list[float]] = None
         if kb.embedding_model_id:
             model_row = self.model_service.get_embedding_model_orm(kb.embedding_model_id)
             query_embedding = embed_query(model_row, query)
 
-        return self.vector.search(
+        max_distance = float(self.settings.kb_rag_max_distance)
+        window = int(self.settings.kb_neighbor_window)
+        mult = int(self.settings.kb_retrieve_candidate_multiplier)
+        candidate_n = max(top_k, top_k * mult if max_distance > 0 else top_k)
+        candidate_n = min(50, candidate_n)
+
+        raw = self.vector.search(
             query=query,
-            n_results=top_k,
+            n_results=candidate_n,
             collection=collection,
             query_embedding=query_embedding,
+        )
+        filtered = filter_by_max_distance(raw, max_distance)
+        primary = filtered[:top_k]
+        if not primary:
+            return []
+
+        if window <= 0:
+            return primary
+
+        neighbor_ids: list[str] = []
+        for hit in primary:
+            neighbor_ids.extend(neighbor_chunk_ids(str(hit.get("id") or ""), window))
+        # 去重且排除已在 primary 中的
+        primary_ids = {str(h.get("id") or "") for h in primary}
+        neighbor_ids = [i for i in dict.fromkeys(neighbor_ids) if i and i not in primary_ids]
+        fetched: list[dict[str, Any]] = []
+        if neighbor_ids:
+            try:
+                fetched = self.vector.get_by_ids(neighbor_ids, collection=collection)
+            except Exception as e:
+                log.warning(f"邻块读取失败，将仅返回主命中: {e}")
+                fetched = []
+        by_id = {str(d.get("id")): d for d in fetched if d.get("id")}
+        max_total = min(20, top_k * (1 + 2 * window))
+        return expand_hits_with_neighbors(
+            primary,
+            by_id,
+            window=window,
+            max_total=max_total,
+        )
+
+    def evaluate_retrieval(
+        self,
+        kb_id: int,
+        req: KnowledgeEvalRequest,
+    ) -> KnowledgeEvalResponse:
+        """黄金集语义检索评测（命中率 / MRR）。"""
+        kb = self._get_accessible_kb(kb_id)
+        if kb.status != 1:
+            raise BusinessError("知识库已禁用")
+
+        case_results: list[KnowledgeEvalCaseResult] = []
+        hit_count = 0
+        mrr_sum = 0.0
+        for case in req.cases:
+            hits = self._retrieve(kb, case.query, req.top_k)
+            ok, rank = score_eval_hit(
+                hits,
+                expect_contains=case.expect_contains,
+                expect_doc_title=case.expect_doc_title,
+            )
+            if ok:
+                hit_count += 1
+                if rank:
+                    mrr_sum += 1.0 / float(rank)
+            reason = "命中" if ok else "未命中"
+            if not (case.expect_contains or "").strip() and not (case.expect_doc_title or "").strip():
+                reason = "缺少 expect_contains / expect_doc_title"
+            case_results.append(
+                KnowledgeEvalCaseResult(
+                    query=case.query,
+                    hit=ok,
+                    hit_at=rank,
+                    reason=reason,
+                    top_ids=[str(h.get("id") or "") for h in hits[:5]],
+                    top_distances=[
+                        float(h["distance"]) if h.get("distance") is not None else None
+                        for h in hits[:5]
+                    ],
+                )
+            )
+        total = len(req.cases)
+        return KnowledgeEvalResponse(
+            total=total,
+            hit_count=hit_count,
+            hit_rate=(hit_count / total) if total else 0.0,
+            mrr=(mrr_sum / total) if total else 0.0,
+            top_k=req.top_k,
+            max_distance=float(self.settings.kb_rag_max_distance),
+            neighbor_window=int(self.settings.kb_neighbor_window),
+            cases=case_results,
         )
 
     @staticmethod

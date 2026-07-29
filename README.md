@@ -22,20 +22,23 @@
 
 ## 快速开始
 
-### 1. 安装 Poetry
+### 方式 A：Docker Compose（推荐）
 
-```bash
-pip install poetry
-```
-
-### 2. 安装依赖
+需本机已安装 Docker，且 `youqiAgent` 与 `youqiAgent-web` 为同级目录。详情见 [`docker/DOCKER.md`](./docker/DOCKER.md)。
 
 ```bash
 cd youqiAgent
-poetry install
+cp .env.docker.example .env.docker
+# 编辑密钥与 CORS 后：
+docker compose --env-file .env.docker up -d --build
+# 浏览器打开 http://127.0.0.1:8091
 ```
 
-### 3. 配置环境变量
+### 方式 B：本地 Poetry
+
+1. 安装 Poetry：`pip install poetry`
+2. 安装依赖：`cd youqiAgent && poetry install`
+3. 配置环境变量：
 
 ```bash
 # Windows PowerShell
@@ -121,9 +124,12 @@ poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `GET/POST /api/v1/internal/knowledge-bases/{id}/documents`
 - `POST /api/v1/internal/knowledge-bases/{id}/documents/upload` — 多文件上传（`multipart/form-data`，字段名 `files`）
 - `DELETE /api/v1/internal/knowledge-bases/{id}/documents/{doc_id}`
-- `POST /api/v1/internal/knowledge-bases/{id}/search`
+- `POST /api/v1/internal/knowledge-bases/{id}/search` — 试检索（含距离门槛与邻块扩展）
+- `POST /api/v1/internal/knowledge-bases/{id}/eval` — 黄金集语义检索评测（命中率 / MRR）
 - 对话请求可传 `knowledge_base_id` / `rag_top_k` 开启 RAG
 - 文件入库走 **Redis 任务队列**（`KB_JOB_WORKERS`），启动时回收卡住任务
+- RAG 精度相关配置：`KB_RAG_MAX_DISTANCE`（`<=0` 关闭门槛）、`KB_NEIGHBOR_WINDOW`、`KB_RETRIEVE_CANDIDATE_MULTIPLIER`
+- 黄金集示例：`data/kb_eval_examples.json`；运维台知识库页提供「评测」入口
 
 ### MCP（外部工具）
 

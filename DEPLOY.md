@@ -3,7 +3,10 @@
 本文记录将本服务部署到阿里云 Ubuntu 服务器，并与本地运维台 `youqiAgent-web` 联调的完整步骤。  
 适用环境示例：Ubuntu 22.04 LTS、2 核 4G、40GB 盘、公网 IP。
 
-> 本服务为 **内部 API**，正式环境建议仅内网供 Java 调用；本地联调可临时开放公网 `8000`。
+> **推荐优先使用 Docker Compose**（MySQL + Redis + API + 运维台，对外 **8091**）。见 [docker/DOCKER.md](./docker/DOCKER.md)。  
+> 下文为不使用 Docker 时的 Poetry + systemd 传统方式（默认端口 **8000**）。
+
+> 本服务为 **内部 API**，正式环境建议仅内网供 Java 调用；本地联调可临时开放公网端口。
 
 ---
 

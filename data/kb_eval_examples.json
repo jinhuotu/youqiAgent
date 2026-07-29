@@ -1,0 +1,12 @@
+[
+  {
+    "query": "设备出现 E12 故障怎么处理",
+    "expect_contains": "E12",
+    "expect_doc_title": "维修"
+  },
+  {
+    "query": "质检外观判定标准是什么",
+    "expect_contains": "外观",
+    "expect_doc_title": null
+  }
+]

@@ -1,0 +1,2 @@
+# Docker entrypoint must use LF
+docker/**/*.sh text eol=lf

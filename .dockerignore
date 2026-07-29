@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.local
+*.pem
+
+# Git / IDE
+.git/
+.github/
+.idea/
+.vscode/
+*.md
+!README.md
+
+# Data & logs (mounted at runtime)
+logs/
+data/
+*.log
+
+# Tests optional in image but we COPY tests for potential runtime; keep out of context bulk
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore

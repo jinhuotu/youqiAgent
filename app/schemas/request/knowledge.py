@@ -42,3 +42,24 @@ class KnowledgeSearchRequest(BaseModel):
 
     query: str = Field(..., min_length=1, description="检索问题")
     top_k: int = Field(default=5, ge=1, le=20, description="召回条数")
+
+
+class KnowledgeEvalCase(BaseModel):
+    """黄金集单条用例。"""
+
+    query: str = Field(..., min_length=1, description="测试问题")
+    expect_contains: Optional[str] = Field(
+        default=None,
+        description="期望命中片段中包含的关键词/原文片段",
+    )
+    expect_doc_title: Optional[str] = Field(
+        default=None,
+        description="期望命中文档标题包含的关键字",
+    )
+
+
+class KnowledgeEvalRequest(BaseModel):
+    """知识库语义检索评测。"""
+
+    cases: list[KnowledgeEvalCase] = Field(..., min_length=1, max_length=100)
+    top_k: int = Field(default=5, ge=1, le=20, description="每条用例召回条数")
