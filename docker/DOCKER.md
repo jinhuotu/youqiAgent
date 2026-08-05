@@ -10,7 +10,7 @@
 - 已安装 Docker / Docker Compose 插件
 - 国内网络：默认基础镜像前缀 `docker.1ms.run/library/...`；pip 用阿里云；npm 用 npmmirror
 - 若构建报 `docker/dockerfile` **403**：确认 Dockerfile **没有** `# syntax=docker/dockerfile:1`
-- 若拉镜像报 **401 / not found / short read unexpected EOF**：国内 Docker 镜像站层不完整时常见。
+- 若 api 日志反复出现 **`exec /entrypoint.sh: no such file or directory`**：多为 Windows 把脚本存成 CRLF。仓库已在镜像构建时 `sed` 去 `\r`；本地也可确认 `docker/api/entrypoint.sh` 为 LF，然后 `docker compose --env-file .env.docker up -d --build api`。
   - API 的 Node 安装已改为：**多镜像源回退 + curl 重试 + SHA256 校验**（截断包不会解压，会换源重试）。
   - 基础镜像拉取过慢：在 `.env.docker` 换 `PYTHON_IMAGE` 前缀，例如
     `docker.m.daocloud.io/library/python:3.12.5-slim-bookworm`、

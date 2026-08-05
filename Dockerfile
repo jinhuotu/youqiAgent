@@ -115,7 +115,8 @@ RUN poetry install --only main --no-ansi \
     && rm -rf /root/.cache /tmp/* /var/lib/apt/lists/*
 
 COPY docker/api/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Windows 检出常为 CRLF，会导致 exec /entrypoint.sh: no such file or directory
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 EXPOSE 8000
 
