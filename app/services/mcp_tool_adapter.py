@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any, Optional
 
 from langchain_core.tools import StructuredTool
@@ -13,12 +15,39 @@ from app.services.mcp_session import DiscoveredTool, mcp_session_manager
 
 log = get_logger("agent.tool_adapter")
 
+# OpenAI / DeepSeek function.name 仅允许 ASCII：^[a-zA-Z0-9_-]+$
+_OPENAI_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+_OPENAI_NAME_MAX = 64
 
-def qualify_tool_name(server_name: str, tool_name: str) -> str:
-    """生成全局唯一工具名。"""
-    safe_server = "".join(c if c.isalnum() or c in "_-" else "_" for c in server_name)
-    safe_tool = "".join(c if c.isalnum() or c in "_-" else "_" for c in tool_name)
-    return f"{safe_server}__{safe_tool}"
+
+def _ascii_slug(text: str, fallback: str) -> str:
+    """去掉非 ASCII 字母数字，压缩连续下划线。"""
+    slug = _OPENAI_NAME_RE.sub("_", text or "")
+    slug = re.sub(r"_+", "_", slug).strip("_-")
+    if slug and re.search(r"[a-zA-Z0-9]", slug):
+        return slug
+    return fallback
+
+
+def qualify_tool_name(
+    server_name: str,
+    tool_name: str,
+    *,
+    server_id: int | None = None,
+) -> str:
+    """生成符合 OpenAI function.name 规则的全局唯一工具名。
+
+    Python ``str.isalnum()`` 会把中文当成合法字符，但 DeepSeek 等会 400：
+    Invalid tools[n].function.name，须匹配 ``^[a-zA-Z0-9_-]+$``。
+    """
+    fallback_server = f"s{server_id}" if server_id is not None else "mcp"
+    safe_server = _ascii_slug(server_name, fallback_server)
+    safe_tool = _ascii_slug(tool_name, "tool")
+    name = f"{safe_server}__{safe_tool}"
+    if len(name) <= _OPENAI_NAME_MAX:
+        return name
+    digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:8]
+    return f"{safe_server[:18]}__{safe_tool[:28]}_{digest}"[:_OPENAI_NAME_MAX]
 
 
 def parse_qualified_tool_name(qualified: str) -> tuple[str, str]:
@@ -64,7 +93,7 @@ def _schema_to_pydantic(name: str, schema: dict[str, Any]) -> type[BaseModel]:
 
 
 def _make_tool(row: McpServer, t: DiscoveredTool) -> StructuredTool:
-    qname = qualify_tool_name(row.name, t.name)
+    qname = qualify_tool_name(row.name, t.name, server_id=row.id)
     args_model = _schema_to_pydantic(qname, t.input_schema or {})
     server_row = row
     tool_name = t.name
