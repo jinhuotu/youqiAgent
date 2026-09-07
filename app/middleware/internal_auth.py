@@ -39,7 +39,9 @@ class InternalAuthMiddleware:
             return
 
         path = scope.get("path", "")
-        if not path.startswith(INTERNAL_PATH_PREFIX):
+        method = scope.get("method", "")
+        # 浏览器 CORS 预检不带业务鉴权头，必须放行给外层 CORSMiddleware
+        if method == "OPTIONS" or not path.startswith(INTERNAL_PATH_PREFIX):
             await self.app(scope, receive, send)
             return
 

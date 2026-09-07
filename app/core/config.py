@@ -147,6 +147,24 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
+    def cors_origin_regex(self) -> str | None:
+        """开发环境额外放行本机 / 局域网 Origin。
+
+        Starlette 对未命中白名单的 OPTIONS 预检直接返回 400 Disallowed CORS origin。
+        Vite ``host: true`` 时浏览器 Origin 可能是局域网 IP 或备用端口，与 .env 精确名单不一致。
+        """
+        if self.is_production:
+            return None
+        return (
+            r"https?://("
+            r"localhost|127\.0\.0\.1|\[::1\]|"
+            r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+            r"192\.168\.\d{1,3}\.\d{1,3}|"
+            r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+            r")(:\d+)?$"
+        )
+
+    @property
     def mysql_dsn(self) -> str:
         """构建 SQLAlchemy MySQL 连接串（PyMySQL 驱动）。"""
         return (

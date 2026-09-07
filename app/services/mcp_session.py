@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,9 @@ from app.core.security import decrypt_text
 from app.db.mysql.models.mcp_server import McpServer, McpTransport
 
 log = get_logger("agent.mcp_session")
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_PYTHON_ALIASES = {"python", "python3", "py"}
 
 
 @dataclass
@@ -175,9 +179,13 @@ class McpSessionManager:
             workdir = Path(self.settings.mcp_workdir).resolve()
             workdir.mkdir(parents=True, exist_ok=True)
             merged_env = {**os.environ, **env}
+            command, args = self._resolve_stdio_command_args(
+                row.command or "",
+                list(row.args or []),
+            )
             params = StdioServerParameters(
-                command=(row.command or "").strip(),
-                args=list(row.args or []),
+                command=command,
+                args=args,
                 env=merged_env,
                 cwd=str(workdir),
             )
@@ -246,6 +254,31 @@ class McpSessionManager:
         if len(text) > max_chars:
             text = text[:max_chars] + "…(truncated)"
         return text
+
+    @staticmethod
+    def _resolve_stdio_command_args(command: str, args: list[Any]) -> tuple[str, list[str]]:
+        """将可移植写法解析为实际可执行路径。
+
+        - command 为 python/python3/py 时，使用当前 API 进程的解释器（同 venv）
+        - 相对脚本路径相对仓库根解析（stdio 工作目录是 MCP_WORKDIR，不能靠相对路径）
+        """
+        cmd = (command or "").strip()
+        base = Path(cmd).name.lower()
+        if base.endswith(".exe"):
+            base = base[:-4]
+        if base in _PYTHON_ALIASES:
+            cmd = sys.executable
+
+        resolved: list[str] = []
+        for raw in args:
+            arg = str(raw)
+            path = Path(arg)
+            if path.is_absolute():
+                resolved.append(arg)
+                continue
+            candidate = (_REPO_ROOT / arg).resolve()
+            resolved.append(str(candidate) if candidate.exists() else arg)
+        return cmd, resolved
 
 
 # 全局单例
