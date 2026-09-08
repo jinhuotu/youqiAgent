@@ -28,6 +28,7 @@ from app.services.mcp_tool_adapter import build_langchain_tools
 from app.services.model_service import ModelService
 from app.services.prompt_service import PromptService
 from app.services.tool_loop import DisconnectChecker, run_tool_loop
+from app.utils.dsml import strip_tool_call_markup
 from app.utils.token_counter import token_counter
 
 log = get_logger("services.chat")
@@ -55,6 +56,11 @@ def _public_llm_error(exc: Exception) -> str:
     if "api_key" in text.lower() or "authorization" in text.lower():
         return "模型鉴权失败，请检查模型 API Key 配置"
     return f"模型调用失败: {text}"
+
+
+def _client_visible_text(text: str) -> str:
+    """发给调用方的正文不得包含 DSML/工具标记。"""
+    return strip_tool_call_markup(text or "")
 
 
 class ChatService:
@@ -95,14 +101,18 @@ class ChatService:
                     if item.get("event") == "final":
                         data = item.get("data") or {}
                         if data.get("skipped"):
-                            answer = await ainvoke_chat(chat_model, messages)
+                            answer = _client_visible_text(
+                                await ainvoke_chat(chat_model, messages)
+                            )
                         else:
-                            answer = str(data.get("content") or "")
+                            answer = _client_visible_text(str(data.get("content") or ""))
                 if not answer and tools:
                     # tool loop 无最终文本时回退
-                    answer = await ainvoke_chat(chat_model, messages)
+                    answer = _client_visible_text(
+                        await ainvoke_chat(chat_model, messages)
+                    )
             else:
-                answer = await ainvoke_chat(chat_model, messages)
+                answer = _client_visible_text(await ainvoke_chat(chat_model, messages))
         except Exception as e:
             log.exception(f"非流式调用失败: conversation_id={conversation.id}, error={e}")
             raise BusinessError(_public_llm_error(e)) from e
@@ -199,7 +209,9 @@ class ChatService:
                     elif event == "final":
                         if data.get("cancelled"):
                             cancelled = True
-                            full_answer = str(data.get("content") or full_answer)
+                            full_answer = _client_visible_text(
+                                str(data.get("content") or full_answer)
+                            )
                             break
                         if data.get("skipped"):
                             async for chunk in astream_chat(chat_model, messages):
@@ -215,8 +227,9 @@ class ChatService:
                                         "message_id": None,
                                     },
                                 }
+                            full_answer = _client_visible_text(full_answer)
                         else:
-                            text = str(data.get("content") or "")
+                            text = _client_visible_text(str(data.get("content") or ""))
                             if text:
                                 full_answer = text
                                 yield {
@@ -230,16 +243,15 @@ class ChatService:
                 if cancelled:
                     pass  # fall through to cancelled save below
                 elif not full_answer:
-                    # 工具路径无输出时回退流式
-                    async for chunk in astream_chat(chat_model, messages):
-                        if is_disconnected is not None and await is_disconnected():
-                            cancelled = True
-                            break
-                        full_answer += chunk
+                    # 工具路径无输出时整段回退，避免流式把 DSML 碎片直接推给第三方
+                    full_answer = _client_visible_text(
+                        await ainvoke_chat(chat_model, messages)
+                    )
+                    if full_answer:
                         yield {
                             "event": "chunk",
                             "data": {
-                                "content": chunk,
+                                "content": full_answer,
                                 "conversation_id": conversation.id,
                                 "message_id": None,
                             },
@@ -263,6 +275,7 @@ class ChatService:
                     }
 
             if cancelled:
+                full_answer = _client_visible_text(full_answer)
                 assistant_content = (
                     f"{full_answer.rstrip()}\n\n（已停止生成）"
                     if full_answer.strip()
@@ -292,6 +305,7 @@ class ChatService:
                 }
                 return
 
+            full_answer = _client_visible_text(full_answer)
             assistant_msg = self._save_message(
                 conversation_id=conversation.id,
                 role=MessageRole.ASSISTANT,
