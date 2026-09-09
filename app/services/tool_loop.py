@@ -18,31 +18,43 @@ log = get_logger("services.tool_loop")
 
 DisconnectChecker = Callable[[], Awaitable[bool]]
 
-_TABLE_FORMAT_HINT = (
+_TOOL_LOOP_HINT = (
     "展示多行查询结果或结构化列表时，请使用 Markdown 表格"
     "（形如 | 列1 | 列2 | 与 | --- | --- |），"
     "不要用空格对齐的纯文本伪表格，便于前端渲染为可横向滚动的真实表格。"
     "禁止在回复中输出 DSML/XML 工具标记；必须通过 function calling 调用工具。"
     "数据已拿到后直接给出表格或结论，不要把工具调用写成正文。"
+    "SQL 查询范围：只能使用 MCP 已配置的连接及当前默认库（如 BestMesDB_MESSOFT）。"
+    "禁止跨库：不要查其它 BestMesDB_*，不要用「其它库.schema.表」，不要 list_databases 后让用户选工厂。"
+    "本库按业务架构（schema）分模块，不要写死某一张表名。"
+    "查数固定三步且尽量短：①按用户意图选定 schema；②list_tables(schema=该架构) 定位表；"
+    "③describe_table 最多一次后立刻 execute_query（Top N 或汇总）。"
+    "意图→架构对照：销售/订单/发货/合同→sale；采购/请购→purc；生产/工单/工序/工位/班组→make；"
+    "库存/仓库/物料库存→invn；质检/质量→qual；财务/应收应付→finance；客户→cust；"
+    "人事/员工/部门→hman；通用主数据/物料档案→dbo 或 comn；报表→report。"
+    "list_tables 默认 dbo，不传 schema 会漏掉业务表。禁止只扫 dbo 就断言「没有该业务」。"
+    "若同一单据有头表+明细表（表名常成对，如 Xxx 与 XxxItem），必须一并查出，不要只出头表。"
+    "头表金额为 0 时以明细数量/金额为准。状态编码尽量译成中文，找不到字典则保留编码。"
+    "不要先 list_connections / test_connection / list_databases。探查类工具合计不超过 3 次。"
 )
 
 
 def _with_table_format_hint(messages: list[BaseMessage]) -> list[BaseMessage]:
-    """在工具对话中补充表格输出格式提示。"""
+    """在工具对话中补充表格输出格式与 SQL 范围提示。"""
     out: list[BaseMessage] = []
     found = False
     for msg in messages:
         if not found and isinstance(msg, SystemMessage):
             text = str(msg.content or "")
-            if "Markdown 表格" not in text:
-                out.append(SystemMessage(content=f"{text}\n\n{_TABLE_FORMAT_HINT}"))
+            if "只能使用 MCP 已配置的连接" not in text:
+                out.append(SystemMessage(content=f"{text}\n\n{_TOOL_LOOP_HINT}"))
             else:
                 out.append(msg)
             found = True
         else:
             out.append(msg)
     if not found:
-        out.insert(0, SystemMessage(content=_TABLE_FORMAT_HINT))
+        out.insert(0, SystemMessage(content=_TOOL_LOOP_HINT))
     return out
 
 
@@ -108,7 +120,24 @@ def _lookup_tool(name: str, tool_map: dict[str, BaseTool]) -> BaseTool | None:
     return None
 
 
-def _as_history_ai(spoken: str, tool_calls: list[dict[str, Any]]) -> AIMessage:
+def _reasoning_kwargs(ai: Any) -> dict[str, Any]:
+    """取出 DeepSeek thinking 的 reasoning_content，多轮必须原样回传。"""
+    extra: dict[str, Any] = {}
+    ak = getattr(ai, "additional_kwargs", None) or {}
+    if isinstance(ak, dict) and ak.get("reasoning_content"):
+        extra["reasoning_content"] = ak["reasoning_content"]
+    rm = getattr(ai, "response_metadata", None) or {}
+    if "reasoning_content" not in extra and isinstance(rm, dict) and rm.get("reasoning_content"):
+        extra["reasoning_content"] = rm["reasoning_content"]
+    return extra
+
+
+def _as_history_ai(
+    spoken: str,
+    tool_calls: list[dict[str, Any]],
+    *,
+    source: Any = None,
+) -> AIMessage:
     """把解析出的调用写成带 tool_calls 的助手消息，供后续 ToolMessage 衔接。"""
     formatted: list[dict[str, Any]] = []
     for tc in tool_calls:
@@ -120,7 +149,11 @@ def _as_history_ai(spoken: str, tool_calls: list[dict[str, Any]]) -> AIMessage:
                 "type": "tool_call",
             }
         )
-    return AIMessage(content=spoken or "", tool_calls=formatted)
+    return AIMessage(
+        content=spoken or "",
+        tool_calls=formatted,
+        additional_kwargs=_reasoning_kwargs(source),
+    )
 
 
 def _extract_tool_calls(ai: AIMessage) -> tuple[str, list[dict[str, Any]], bool]:
@@ -173,6 +206,10 @@ async def run_tool_loop(
             return
 
         log.info(f"Tool loop 轮次 {round_i + 1}/{max_rounds}")
+        yield {
+            "event": "status",
+            "data": {"message": f"正在调用模型（第 {round_i + 1} 轮）…", "round": round_i + 1},
+        }
         ai: AIMessage = await bound.ainvoke(lc_messages)  # type: ignore[assignment]
         spoken, tool_calls, from_dsml = _extract_tool_calls(ai)
 
@@ -181,7 +218,9 @@ async def run_tool_loop(
             return
 
         # DSML 写在 content 里时，必须改写成结构化 tool_calls，否则下一轮无法接 ToolMessage
-        lc_messages.append(_as_history_ai(spoken, tool_calls) if from_dsml else ai)
+        lc_messages.append(
+            _as_history_ai(spoken, tool_calls, source=ai) if from_dsml else ai
+        )
         for tc in tool_calls:
             if is_disconnected is not None and await is_disconnected():
                 yield {
@@ -236,7 +275,7 @@ async def run_tool_loop(
     if extra_calls:
         log.info(f"收尾回复含 DSML，补执行 {len(extra_calls)} 个工具")
         if from_dsml:
-            lc_messages.append(_as_history_ai(spoken, extra_calls))
+            lc_messages.append(_as_history_ai(spoken, extra_calls, source=closing))
         else:
             lc_messages.append(closing)  # type: ignore[arg-type]
         for tc in extra_calls:

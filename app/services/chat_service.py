@@ -44,6 +44,14 @@ _SUMMARY_SYSTEM_PROMPT = (
 
 def _public_llm_error(exc: Exception) -> str:
     """对外暴露的精简错误信息，避免泄露上游细节。"""
+    text = str(exc).strip()
+    lowered = text.lower()
+    if "reasoning_content" in lowered:
+        return (
+            "模型 thinking 模式要求回传推理内容，当前多轮工具调用未带上该字段。"
+            "不是余额问题。请重启已关闭 thinking 的后端后重试；"
+            "若需开启思考，设置 LLM_ENABLE_THINKING=true 并确保助手消息回传 reasoning_content"
+        )
     status = getattr(exc, "status_code", None)
     if status is not None:
         return f"模型服务调用失败（HTTP {status}），请检查模型配置、密钥与额度后重试"
@@ -55,6 +63,13 @@ def _public_llm_error(exc: Exception) -> str:
         text = text[:160] + "…"
     if "api_key" in text.lower() or "authorization" in text.lower():
         return "模型鉴权失败，请检查模型 API Key 配置"
+    lowered = text.lower()
+    if "connection error" in lowered or "connecterror" in lowered or "all connection attempts failed" in lowered:
+        return (
+            "无法连接模型 API（不是网页版 chat.deepseek.com）。"
+            "请确认模型管理里的 base_url/API Key，并检查本机代理；"
+            "可在 .env 设置 LLM_HTTP_TRUST_ENV=false 后重启后端再试"
+        )
     return f"模型调用失败: {text}"
 
 
@@ -156,7 +171,9 @@ class ChatService:
         stream_key: Optional[str] = None
         cancelled = False
         try:
-            conversation, model_row, messages, rag_sources = await self._prepare_context(req)
+            conversation, model_row, messages, rag_sources = await self._prepare_context(
+                req, run_rag=False
+            )
             chat_model = LLMFactory.create_from_model_row(
                 model_row,
                 temperature=req.temperature,
@@ -179,6 +196,27 @@ class ChatService:
                 ttl=600,
             )
 
+            yield {
+                "event": "status",
+                "data": {
+                    "message": "正在处理…",
+                    "conversation_id": conversation.id,
+                },
+            }
+
+            if req.knowledge_base_id:
+                yield {
+                    "event": "status",
+                    "data": {
+                        "message": "正在检索知识库…",
+                        "conversation_id": conversation.id,
+                    },
+                }
+                rag_messages, rag_sources = self._rag_system_messages(req)
+                insert_at = 1 if messages and messages[0].get("role") == "system" else 0
+                for i, item in enumerate(rag_messages):
+                    messages.insert(insert_at + i, item)
+
             if rag_sources:
                 yield {
                     "event": "sources",
@@ -190,6 +228,13 @@ class ChatService:
 
             tools = self._resolve_mcp_tools(req)
             if tools:
+                yield {
+                    "event": "status",
+                    "data": {
+                        "message": "正在查询业务数据…",
+                        "conversation_id": conversation.id,
+                    },
+                }
                 async for item in run_tool_loop(
                     chat_model,
                     messages,
@@ -198,7 +243,7 @@ class ChatService:
                 ):
                     event = item.get("event")
                     data = item.get("data") or {}
-                    if event in ("tool_call", "tool_result"):
+                    if event in ("tool_call", "tool_result", "status"):
                         yield {
                             "event": event,
                             "data": {
@@ -243,19 +288,19 @@ class ChatService:
                 if cancelled:
                     pass  # fall through to cancelled save below
                 elif not full_answer:
-                    # 工具路径无输出时整段回退，避免流式把 DSML 碎片直接推给第三方
-                    full_answer = _client_visible_text(
-                        await ainvoke_chat(chat_model, messages)
+                    # 工具路径已跑完仍无正文：不要再卡一轮 LLM，避免页面一直转
+                    full_answer = (
+                        "当前没有可展示的查询结果。"
+                        "若是查库问题，请确认 MCP 已配置库中是否存在对应表。"
                     )
-                    if full_answer:
-                        yield {
-                            "event": "chunk",
-                            "data": {
-                                "content": full_answer,
-                                "conversation_id": conversation.id,
-                                "message_id": None,
-                            },
-                        }
+                    yield {
+                        "event": "chunk",
+                        "data": {
+                            "content": full_answer,
+                            "conversation_id": conversation.id,
+                            "message_id": None,
+                        },
+                    }
             else:
                 async for chunk in astream_chat(chat_model, messages):
                     if is_disconnected is not None and await is_disconnected():
@@ -431,9 +476,56 @@ class ChatService:
             log.warning(f"加载 MCP 工具失败，将跳过工具调用: {e}")
             return []
 
+    def _rag_system_messages(
+        self,
+        req: ChatInvokeRequest,
+    ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+        """检索知识库并返回待插入的 system 消息。失败时不打断对话。"""
+        if not req.knowledge_base_id:
+            return [], []
+        try:
+            hits = self.knowledge_service.retrieve_for_rag(
+                req.knowledge_base_id,
+                req.message,
+                top_k=req.rag_top_k,
+            )
+            rag_text = KnowledgeService.format_rag_context(hits)
+            if rag_text:
+                sources = KnowledgeService.hits_to_sources(
+                    hits,
+                    preview_chars=self.settings.kb_source_preview_chars,
+                )
+                log.info(
+                    f"RAG 注入成功: kb_id={req.knowledge_base_id}, hits={len(hits)}"
+                )
+                return [{"role": "system", "content": rag_text}], sources
+            log.info(f"RAG 无命中: kb_id={req.knowledge_base_id}")
+            return [
+                {
+                    "role": "system",
+                    "content": (
+                        "知识库未检索到与当前问题直接相关的资料。"
+                        "请明确告知用户资料不足，不要编造维修方法或质检标准。"
+                    ),
+                }
+            ], []
+        except Exception as e:
+            log.warning(f"RAG 检索失败，将忽略知识库: {e}")
+            return [
+                {
+                    "role": "system",
+                    "content": (
+                        "知识库检索暂时失败。请告知用户当前无法依据知识库作答，"
+                        "并建议稍后重试或补充更具体的设备/质检问题，不要编造。"
+                    ),
+                }
+            ], []
+
     async def _prepare_context(
         self,
         req: ChatInvokeRequest,
+        *,
+        run_rag: bool = True,
     ) -> tuple[Conversation, Any, list[dict[str, str]], list[dict[str, Any]]]:
         """准备会话、模型与拼装后的消息上下文。
 
@@ -461,13 +553,15 @@ class ChatService:
             # create 返回的是 Response，需重新取 ORM
             conversation = self.conversation_service.get_owned_orm(conversation.id)
 
-        messages, rag_sources = self._build_messages(conversation, req)
+        messages, rag_sources = self._build_messages(conversation, req, run_rag=run_rag)
         return conversation, model_row, messages, rag_sources
 
     def _build_messages(
         self,
         conversation: Conversation,
         req: ChatInvokeRequest,
+        *,
+        run_rag: bool = True,
     ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
         """按规则组装上下文：system(模板/总结) + 历史 + 当前用户消息。
 
@@ -489,45 +583,9 @@ class ChatService:
                 log.warning(f"提示词模板不存在: id={req.prompt_template_id}")
 
         # 1.5) 知识库 RAG 检索注入
-        if req.knowledge_base_id:
-            try:
-                hits = self.knowledge_service.retrieve_for_rag(
-                    req.knowledge_base_id,
-                    req.message,
-                    top_k=req.rag_top_k,
-                )
-                rag_text = KnowledgeService.format_rag_context(hits)
-                if rag_text:
-                    messages.append({"role": "system", "content": rag_text})
-                    rag_sources = KnowledgeService.hits_to_sources(
-                        hits,
-                        preview_chars=self.settings.kb_source_preview_chars,
-                    )
-                    log.info(
-                        f"RAG 注入成功: kb_id={req.knowledge_base_id}, hits={len(hits)}"
-                    )
-                else:
-                    log.info(f"RAG 无命中: kb_id={req.knowledge_base_id}")
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": (
-                                "知识库未检索到与当前问题直接相关的资料。"
-                                "请明确告知用户资料不足，不要编造维修方法或质检标准。"
-                            ),
-                        }
-                    )
-            except Exception as e:
-                log.warning(f"RAG 检索失败，将忽略知识库: {e}")
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "知识库检索暂时失败。请告知用户当前无法依据知识库作答，"
-                            "并建议稍后重试或补充更具体的设备/质检问题，不要编造。"
-                        ),
-                    }
-                )
+        if run_rag and req.knowledge_base_id:
+            rag_messages, rag_sources = self._rag_system_messages(req)
+            messages.extend(rag_messages)
 
         # 2) 会话历史总结注入
         if conversation.summary:

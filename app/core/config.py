@@ -123,6 +123,16 @@ class Settings(BaseSettings):
         description="工具结果写入模型上下文的最大字符数",
     )
 
+    # ---------- LLM HTTP ----------
+    llm_http_trust_env: bool = Field(
+        default=False,
+        description="httpx 是否读取 HTTP(S)_PROXY；False 则直连模型接口",
+    )
+    llm_enable_thinking: bool = Field(
+        default=False,
+        description="DeepSeek thinking 模式；工具多轮默认关闭，否则易因未回传 reasoning_content 而 HTTP 400",
+    )
+
     @property
     def mcp_command_allowlist_set(self) -> set[str]:
         """解析 stdio 命令白名单。"""

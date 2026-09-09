@@ -8,6 +8,7 @@ from openai import APIStatusError, NotFoundError
 from app.core.exceptions import BusinessError
 from app.core.logger import get_logger
 from app.core.security import decrypt_text
+from app.services.llm.http import build_async_http_client, build_sync_http_client
 
 log = get_logger("services.llm.embedding")
 
@@ -42,6 +43,8 @@ def build_embeddings_from_model_row(model_row: Any) -> OpenAIEmbeddings:
         api_key=plain_key or "EMPTY",
         base_url=base_url,
         check_embedding_ctx_length=False,
+        http_client=build_sync_http_client(connect=8.0, read=20.0),
+        http_async_client=build_async_http_client(connect=8.0, read=20.0),
     )
 
 
