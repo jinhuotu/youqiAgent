@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from app.core.logger import get_logger
 from app.db.mysql.models.mcp_server import McpServer
+from app.services.chart_followup import is_chart_tool
 from app.services.mcp_session import DiscoveredTool, mcp_session_manager
 
 log = get_logger("agent.tool_adapter")
@@ -133,6 +134,12 @@ def _make_tool(row: McpServer, t: DiscoveredTool) -> StructuredTool:
             f"{description} 默认只列出 dbo。"
             "必须先按问题选架构再查：销售→sale，采购→purc，生产/工位班组→make，"
             "库存→invn，质检→qual，财务→finance，客户→cust。不要写死某一张表。"
+        )
+    elif is_chart_tool(tool_name):
+        description = (
+            f"{description} 在 execute_query 返回数据后必须调用本工具绘图。"
+            "把查询行映射为 data：分类字段→category 或 time，数值字段→value，不超过 30 个点。"
+            "成功时 resultObj 为图片 URL，最终回复必须用 ![图表](url) 展示。"
         )
 
     async def _arun(**kwargs: Any) -> str:

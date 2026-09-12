@@ -18,6 +18,7 @@ from app.db.mysql.models.message import Message, MessageRole
 from app.db.redis import CACHE_PREFIX_STREAM_STATE, RedisCache
 from app.schemas.request.chat import ChatInvokeRequest, ConversationCreateRequest
 from app.schemas.response.chat import ChatInvokeResponse, RagSourceItem
+from app.services.chart_followup import is_chart_tool, is_sql_query_tool
 from app.services.conversation_service import ConversationService
 from app.services.knowledge_service import KnowledgeService
 from app.services.llm import ollama as _ollama  # noqa: F401  触发注册
@@ -458,11 +459,17 @@ class ChatService:
     # -------------------- 上下文准备 --------------------
 
     def _resolve_mcp_tools(self, req: ChatInvokeRequest) -> list:
-        """加载全局启用的 MCP 工具（可按 server / 工具名过滤）。"""
+        """加载全局启用的 MCP 工具（可按 server / 工具名过滤）。
+
+        若本次已加载 SQL 查询工具但未加载绘图 MCP，则自动附上已启用的图表服务，
+        保证查库后可以跟进 generate_*_chart。
+        """
         try:
-            bundles = McpServerService(self.db).build_tool_bundles(
+            mcp_service = McpServerService(self.db)
+            bundles = mcp_service.build_tool_bundles(
                 mcp_server_ids=req.mcp_server_ids,
             )
+            bundles = self._attach_chart_bundles(mcp_service, bundles)
             if not bundles:
                 return []
             tools = build_langchain_tools(bundles)
@@ -475,6 +482,31 @@ class ChatService:
         except Exception as e:
             log.warning(f"加载 MCP 工具失败，将跳过工具调用: {e}")
             return []
+
+    @staticmethod
+    def _attach_chart_bundles(mcp_service: McpServerService, bundles: list) -> list:
+        """查库场景下自动附上已启用的 AntV 图表 MCP。"""
+        if not bundles:
+            return bundles
+        has_sql = any(
+            is_sql_query_tool(tool.name) for _, tools in bundles for tool in tools
+        )
+        has_chart = any(
+            is_chart_tool(tool.name) for _, tools in bundles for tool in tools
+        )
+        if not has_sql or has_chart:
+            return bundles
+        selected = {row.id for row, _ in bundles}
+        extra: list = []
+        for row, tools in mcp_service.build_tool_bundles():
+            if row.id in selected:
+                continue
+            if any(is_chart_tool(tool.name) for tool in tools) or "chart" in (
+                row.name or ""
+            ).lower():
+                extra.append((row, tools))
+                log.info(f"查库场景自动附加绘图 MCP: id={row.id} name={row.name}")
+        return bundles + extra
 
     def _rag_system_messages(
         self,

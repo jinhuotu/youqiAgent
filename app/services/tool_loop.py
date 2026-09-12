@@ -12,6 +12,14 @@ from langchain_core.tools import BaseTool
 
 from app.core.config import get_settings
 from app.core.logger import get_logger
+from app.services.chart_followup import (
+    CHART_FOLLOWUP_HINT,
+    append_chart_markdown,
+    extract_chart_image_url,
+    is_chart_tool,
+    is_sql_query_tool,
+    query_result_has_rows,
+)
 from app.utils.dsml import parse_tool_calls_from_content, strip_tool_call_markup
 
 log = get_logger("services.tool_loop")
@@ -23,7 +31,12 @@ _TOOL_LOOP_HINT = (
     "（形如 | 列1 | 列2 | 与 | --- | --- |），"
     "不要用空格对齐的纯文本伪表格，便于前端渲染为可横向滚动的真实表格。"
     "禁止在回复中输出 DSML/XML 工具标记；必须通过 function calling 调用工具。"
-    "数据已拿到后直接给出表格或结论，不要把工具调用写成正文。"
+    "execute_query 一旦返回多行或汇总数据，必须立刻再调用 generate_*_chart 绘图"
+    "（柱状 generate_column_chart、条形 generate_bar_chart、折线 generate_line_chart、"
+    "占比 generate_pie_chart）。把查询结果映射为工具 data："
+    "1 个分类字段→category 或 time，1 个数值字段→value，点数不超过 30，不要塞整张宽表。"
+    "图表工具返回的 resultObj 是图片 URL，最终回复必须用 Markdown 图片写出：![图表](url)。"
+    "表格可以同时给，但不能替代绘图；没有 generate_*_chart 工具时才可以只给表格。"
     "SQL 查询范围：只能使用 MCP 已配置的连接及当前默认库（如 BestMesDB_MESSOFT）。"
     "禁止跨库：不要查其它 BestMesDB_*，不要用「其它库.schema.表」，不要 list_databases 后让用户选工厂。"
     "本库按业务架构（schema）分模块，不要写死某一张表名。"
@@ -196,6 +209,10 @@ async def run_tool_loop(
     tool_map = {t.name: t for t in tools}
     bound = chat_model.bind_tools(tools)
     lc_messages = _with_table_format_hint(dict_messages_to_lc(messages))
+    has_chart_tools = any(is_chart_tool(name) for name in tool_map)
+    pending_chart = False
+    chart_nudge_used = False
+    chart_urls: list[str] = []
 
     for round_i in range(max_rounds):
         if is_disconnected is not None and await is_disconnected():
@@ -214,7 +231,22 @@ async def run_tool_loop(
         spoken, tool_calls, from_dsml = _extract_tool_calls(ai)
 
         if not tool_calls:
-            yield {"event": "final", "data": {"content": spoken, "cancelled": False}}
+            if has_chart_tools and pending_chart and not chart_nudge_used:
+                chart_nudge_used = True
+                log.info("查询已返回数据但未绘图，注入图表跟进提示")
+                lc_messages.append(SystemMessage(content=CHART_FOLLOWUP_HINT))
+                yield {
+                    "event": "status",
+                    "data": {"message": "正在根据查询结果绘图…", "round": round_i + 1},
+                }
+                continue
+            yield {
+                "event": "final",
+                "data": {
+                    "content": append_chart_markdown(spoken, chart_urls),
+                    "cancelled": False,
+                },
+            }
             return
 
         # DSML 写在 content 里时，必须改写成结构化 tool_calls，否则下一轮无法接 ToolMessage
@@ -255,6 +287,17 @@ async def run_tool_loop(
                     log.exception(f"工具执行失败: {name}")
                     result_text = f"工具执行失败: {e}"
 
+            image_url = None
+            if is_sql_query_tool(name) and query_result_has_rows(str(result_text)):
+                pending_chart = True
+            if is_chart_tool(name):
+                image_url = extract_chart_image_url(str(result_text))
+                if image_url:
+                    chart_urls.append(image_url)
+                    pending_chart = False
+                elif not str(result_text).startswith(("工具执行失败", "未知工具", "[tool error]")):
+                    pending_chart = False
+
             yield {
                 "event": "tool_result",
                 "data": {
@@ -262,6 +305,7 @@ async def run_tool_loop(
                     "name": name,
                     "content": result_text,
                     "round": round_i + 1,
+                    **({"image_url": image_url} if image_url else {}),
                 },
             }
             lc_messages.append(
@@ -300,6 +344,9 @@ async def run_tool_loop(
                     "round": max_rounds,
                 },
             }
+            image_url = extract_chart_image_url(str(result_text)) if is_chart_tool(name) else None
+            if image_url:
+                chart_urls.append(image_url)
             yield {
                 "event": "tool_result",
                 "data": {
@@ -307,6 +354,7 @@ async def run_tool_loop(
                     "name": name,
                     "content": result_text,
                     "round": max_rounds,
+                    **({"image_url": image_url} if image_url else {}),
                 },
             }
             lc_messages.append(
@@ -320,7 +368,7 @@ async def run_tool_loop(
     yield {
         "event": "final",
         "data": {
-            "content": spoken,
+            "content": append_chart_markdown(spoken, chart_urls),
             "cancelled": False,
             "truncated": True,
         },
